@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import queue
 import shutil
 import socket
 import struct
@@ -11,17 +12,27 @@ import sys
 import tempfile
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_DIR = Path(__file__).resolve().parent
+def _app_dir() -> Path:
+    """Carpeta del .exe si está empaquetado; si no, la del script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = _app_dir()
 SONIDOS_DIR = APP_DIR / "sonidos"
 CONFIG_PATH = APP_DIR / "config.json"
 PUERTO = 45678
 EXTENSIONES = {".mp3", ".wav", ".ogg", ".wma", ".m4a", ".aac"}
 NOMBRE_STARTUP = "DespertadorEmas.vbs"
 ALIAS_AUDIO = "despertador_emas"
+PING_NOMBRE = "__DESPERTADOR_PING__"
+PONG_RESPUESTA = b"PONG"
 
 
 def ip_local() -> str:
@@ -156,6 +167,19 @@ def enviar_sonido(ip: str, puerto: int, ruta: Path, volumen: int = 100) -> None:
         sock.sendall(bytes([_volumen_valido(volumen)]))
 
 
+def probar_conexion(ip: str, puerto: int, timeout: float = 3.0) -> None:
+    """Comprueba que el compañero tenga el despertador abierto y responda."""
+    nombre = PING_NOMBRE.encode("utf-8")
+    with socket.create_connection((ip, puerto), timeout=timeout) as sock:
+        sock.sendall(struct.pack("!I", len(nombre)))
+        sock.sendall(nombre)
+        sock.sendall(struct.pack("!Q", 0))
+        sock.settimeout(timeout)
+        respuesta = _recv_exact(sock, len(PONG_RESPUESTA))
+        if respuesta != PONG_RESPUESTA:
+            raise ConnectionError("El compañero respondió algo inesperado.")
+
+
 def _leer_volumen(sock: socket.socket) -> int:
     """Lee el volumen opcional que va después del audio. Si no llega, usa 100."""
     anterior = sock.gettimeout()
@@ -186,8 +210,16 @@ def manejar_cliente(conn: socket.socket) -> None:
     try:
         with conn:
             nlen = struct.unpack("!I", _recv_exact(conn, 4))[0]
+            if nlen > 1024:
+                raise ValueError("Nombre de archivo inválido")
             nombre = _recv_exact(conn, nlen).decode("utf-8")
             size = struct.unpack("!Q", _recv_exact(conn, 8))[0]
+
+            # Handshake liviano para el botón "Probar conexión".
+            if nombre == PING_NOMBRE:
+                conn.sendall(PONG_RESPUESTA)
+                return
+
             if size > 30 * 1024 * 1024:
                 raise ValueError("Archivo de audio demasiado grande")
             datos = _recv_exact(conn, size)
@@ -235,19 +267,41 @@ def ruta_startup() -> Path:
 
 def crear_acceso_startup() -> Path:
     destino = ruta_startup()
-    pythonw = Path(sys.executable)
-    if pythonw.name.lower() == "python.exe":
-        candidato = pythonw.with_name("pythonw.exe")
-        if candidato.exists():
-            pythonw = candidato
-
-    script = Path(__file__).resolve()
-    contenido = (
-        'Set sh = CreateObject("WScript.Shell")\r\n'
-        f'sh.Run """{pythonw}"" ""{script}""", 0, False\r\n'
-    )
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        contenido = (
+            'Set sh = CreateObject("WScript.Shell")\r\n'
+            f'sh.Run """{exe}""", 0, False\r\n'
+        )
+    else:
+        pythonw = Path(sys.executable)
+        if pythonw.name.lower() == "python.exe":
+            candidato = pythonw.with_name("pythonw.exe")
+            if candidato.exists():
+                pythonw = candidato
+        script = Path(__file__).resolve()
+        contenido = (
+            'Set sh = CreateObject("WScript.Shell")\r\n'
+            f'sh.Run """{pythonw}"" ""{script}""", 0, False\r\n'
+        )
     destino.write_text(contenido, encoding="utf-8")
     return destino
+
+
+def asegurar_sonidos_empaquetados() -> None:
+    """Si el .exe trae sonidos de ejemplo y la carpeta está vacía, los copia."""
+    SONIDOS_DIR.mkdir(exist_ok=True)
+    if any(SONIDOS_DIR.iterdir()):
+        return
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+    origen = Path(meipass) / "sonidos"
+    if not origen.is_dir():
+        return
+    for p in origen.iterdir():
+        if p.is_file() and p.suffix.lower() in EXTENSIONES:
+            shutil.copy2(p, SONIDOS_DIR / p.name)
 
 
 def quitar_acceso_startup() -> bool:
@@ -258,12 +312,167 @@ def quitar_acceso_startup() -> bool:
     return False
 
 
+# --- Bandeja del sistema (Windows, sin dependencias extra) ---
+_NIM_ADD = 0
+_NIM_DELETE = 2
+_NIF_MESSAGE = 1
+_NIF_ICON = 2
+_NIF_TIP = 4
+_WM_USER = 0x0400
+_WM_TRAYICON = _WM_USER + 42
+_WM_LBUTTONUP = 0x0202
+_WM_LBUTTONDBLCLK = 0x0203
+_WM_RBUTTONUP = 0x0205
+_NIN_SELECT = _WM_USER + 0
+_NIN_KEYSELECT = _WM_USER + 1
+_IDI_APPLICATION = 32512
+_SW_RESTORE = 9
+_GWLP_WNDPROC = -4
+_LRESULT = ctypes.c_ssize_t
+_WPARAM = ctypes.c_size_t
+_LPARAM = ctypes.c_ssize_t
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    _LRESULT,
+    wintypes.HWND,
+    wintypes.UINT,
+    _WPARAM,
+    _LPARAM,
+)
+
+_user32 = ctypes.windll.user32
+_shell32 = ctypes.windll.shell32
+_user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+_user32.LoadIconW.restype = wintypes.HICON
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.ShowWindow.restype = wintypes.BOOL
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
+_user32.GetParent.argtypes = [wintypes.HWND]
+_user32.GetParent.restype = wintypes.HWND
+_shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+_shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    _SetWindowLong = _user32.SetWindowLongPtrW
+    _CallWindowProc = _user32.CallWindowProcW
+else:
+    _SetWindowLong = _user32.SetWindowLongW
+    _CallWindowProc = _user32.CallWindowProcW
+# Sin argtypes, en 64-bit se truncan los punteros y el enganche falla.
+_SetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+_SetWindowLong.restype = ctypes.c_void_p
+_CallWindowProc.argtypes = [
+    ctypes.c_void_p,
+    wintypes.HWND,
+    wintypes.UINT,
+    _WPARAM,
+    _LPARAM,
+]
+_CallWindowProc.restype = _LRESULT
+
+
+class _NOTIFYICONDATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", wintypes.HWND),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", wintypes.HICON),
+        ("szTip", ctypes.c_wchar * 128),
+    ]
+
+
+def _hwnd_de_widget(widget: tk.Misc) -> int:
+    """HWND Win32 real de una ventana Tk."""
+    widget.update_idletasks()
+    hwnd = int(widget.winfo_id())
+    padre = _user32.GetParent(hwnd)
+    return int(padre) if padre else hwnd
+
+
+class IconoBandeja:
+    """Icono en la bandeja: intercepta mensajes del HWND de Tk y encola pedidos."""
+
+    def __init__(self, hwnd: int, pedidos: queue.SimpleQueue[str]) -> None:
+        self._hwnd = wintypes.HWND(hwnd)
+        self._pedidos = pedidos
+        self._activo = False
+        self._hicon = _user32.LoadIconW(
+            None, ctypes.cast(_IDI_APPLICATION, wintypes.LPCWSTR)
+        )
+        if not self._hicon:
+            raise OSError("No se pudo cargar el icono de la bandeja.")
+
+        self._wndproc = _WNDPROC(self._procesar)
+        self._prev_wndproc = _SetWindowLong(
+            self._hwnd, _GWLP_WNDPROC, ctypes.cast(self._wndproc, ctypes.c_void_p)
+        )
+        if not self._prev_wndproc:
+            raise OSError("No se pudo enganchar la ventana a la bandeja.")
+
+    def _nid(self) -> _NOTIFYICONDATA:
+        nid = _NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATA)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        nid.uFlags = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_TRAYICON
+        nid.hIcon = self._hicon
+        nid.szTip = "Despertador de Emas"
+        return nid
+
+    def mostrar(self) -> None:
+        if self._activo:
+            return
+        if not _shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(self._nid())):
+            raise OSError("No se pudo agregar el icono a la bandeja.")
+        self._activo = True
+
+    def ocultar(self) -> None:
+        if not self._activo:
+            return
+        _shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(self._nid()))
+        self._activo = False
+
+    def destruir(self) -> None:
+        self.ocultar()
+        if self._prev_wndproc:
+            _SetWindowLong(self._hwnd, _GWLP_WNDPROC, self._prev_wndproc)
+            self._prev_wndproc = None
+
+    def _procesar(
+        self,
+        hwnd: int,
+        msg: int,
+        wparam: int,
+        lparam: int,
+    ) -> int:
+        if msg == _WM_TRAYICON:
+            evento = int(lparam) & 0xFFFF
+            if evento in (
+                _WM_LBUTTONUP,
+                _WM_LBUTTONDBLCLK,
+                _NIN_SELECT,
+                _NIN_KEYSELECT,
+            ):
+                self._pedidos.put("mostrar")
+                return 0
+            if evento == _WM_RBUTTONUP:
+                self._pedidos.put("menu")
+                return 0
+        return int(
+            _CallWindowProc(self._prev_wndproc, hwnd, msg, wparam, lparam)
+        )
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Despertador de Emas")
-        self.geometry("460x900")
-        self.minsize(420, 840)
+        self.geometry("460x940")
+        self.minsize(420, 880)
         self.configure(bg="#1a1f2e")
 
         self.config_data = cargar_config()
@@ -273,8 +482,12 @@ class App(tk.Tk):
         self._cargando_companero = False
         self.stop_event = threading.Event()
         self.puerto = int(self.config_data.get("puerto", PUERTO))
+        self._en_bandeja = False
+        self._hwnd_app = 0
+        self._pedidos_bandeja: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.bandeja: IconoBandeja | None = None
 
-        SONIDOS_DIR.mkdir(exist_ok=True)
+        asegurar_sonidos_empaquetados()
         self._armar_ui()
         self._refrescar_lista()
         self._refrescar_companeros()
@@ -284,6 +497,8 @@ class App(tk.Tk):
         )
         self.servidor_hilo.start()
         self.protocol("WM_DELETE_WINDOW", self._al_cerrar)
+        self.after(200, self._iniciar_bandeja)
+        self.after(150, self._procesar_pedidos_bandeja)
 
     def _armar_ui(self) -> None:
         estilo = {"bg": "#1a1f2e", "fg": "#e8ecf4"}
@@ -387,6 +602,30 @@ class App(tk.Tk):
                 padx=10,
                 pady=6,
             ).pack(side="left", padx=(0 if texto == "Guardar compañero" else 8, 0))
+
+        marco_conexion = tk.Frame(marco_ip, bg="#1a1f2e")
+        marco_conexion.pack(fill="x", pady=(10, 0))
+        self.btn_conexion = tk.Button(
+            marco_conexion,
+            text="Probar conexión",
+            command=self._probar_conexion,
+            bg="#2f6b4f",
+            fg="#e8ecf4",
+            activebackground="#3a8560",
+            activeforeground="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=6,
+        )
+        self.btn_conexion.pack(side="left")
+        self.lbl_conexion = tk.Label(
+            marco_conexion,
+            text="Sin comprobar",
+            font=("Segoe UI", 10),
+            bg="#1a1f2e",
+            fg="#8b95a8",
+        )
+        self.lbl_conexion.pack(side="left", padx=(12, 0))
 
         marco_sonidos = tk.Frame(self, bg="#1a1f2e")
         marco_sonidos.pack(fill="both", expand=True, padx=24, pady=(16, 8))
@@ -493,7 +732,7 @@ class App(tk.Tk):
         self.btn_despertar.pack(fill="x", padx=24, pady=(8, 12))
 
         marco_startup = tk.Frame(self, bg="#1a1f2e")
-        marco_startup.pack(fill="x", padx=24, pady=(0, 16))
+        marco_startup.pack(fill="x", padx=24, pady=(0, 8))
         tk.Button(
             marco_startup,
             text="Agregar al inicio de Windows",
@@ -516,6 +755,38 @@ class App(tk.Tk):
             padx=8,
             pady=5,
         ).pack(side="left", padx=(8, 0))
+
+        marco_bandeja = tk.Frame(self, bg="#1a1f2e")
+        marco_bandeja.pack(fill="x", padx=24, pady=(0, 12))
+        self.cerrar_a_bandeja_var = tk.BooleanVar(
+            value=bool(self.config_data.get("cerrar_a_bandeja", True))
+        )
+        self.chk_bandeja = tk.Checkbutton(
+            marco_bandeja,
+            text="Al cerrar, minimizar a la bandeja",
+            variable=self.cerrar_a_bandeja_var,
+            command=self._guardar_preferencias,
+            bg="#1a1f2e",
+            fg="#e8ecf4",
+            activebackground="#1a1f2e",
+            activeforeground="#e8ecf4",
+            selectcolor="#2a3142",
+            font=("Segoe UI", 10),
+            anchor="w",
+        )
+        self.chk_bandeja.pack(fill="x")
+        self.btn_bandeja = tk.Button(
+            marco_bandeja,
+            text="Minimizar a bandeja",
+            command=self._minimizar_a_bandeja,
+            bg="#2f3b52",
+            fg="#e8ecf4",
+            activebackground="#3a4863",
+            relief="flat",
+            padx=8,
+            pady=5,
+        )
+        self.btn_bandeja.pack(anchor="w", pady=(6, 0))
 
         self.estado = tk.Label(
             self,
@@ -547,6 +818,7 @@ class App(tk.Tk):
         self.config_data["ip_companero"] = self.ip_var.get().strip()
         self.config_data["puerto"] = self.puerto
         self.config_data["volumen"] = self._volumen_actual()
+        self.config_data["cerrar_a_bandeja"] = bool(self.cerrar_a_bandeja_var.get())
         guardar_config(self.config_data)
 
     def _refrescar_companeros(self, seleccionar: str | None = None) -> None:
@@ -721,6 +993,58 @@ class App(tk.Tk):
 
         threading.Thread(target=trabajo, daemon=True).start()
 
+    def _marcar_conexion(self, ok: bool, detalle: str) -> None:
+        if ok:
+            self.lbl_conexion.config(text=detalle, fg="#6bcf8e")
+        else:
+            self.lbl_conexion.config(text=detalle, fg="#e07a5f")
+        self.estado.config(text=detalle)
+
+    def _probar_conexion(self) -> None:
+        ip = self.ip_var.get().strip()
+        if not ip:
+            messagebox.showinfo(
+                "Conexión",
+                "Elige un compañero o escribe su IP primero.",
+            )
+            return
+
+        destino = self.companero_var.get().strip() or ip
+        self.btn_conexion.config(state="disabled")
+        self.lbl_conexion.config(text="Comprobando…", fg="#8b95a8")
+        self.estado.config(text=f"Probando conexión con {destino} ({ip})…")
+
+        def trabajo() -> None:
+            try:
+                probar_conexion(ip, self.puerto)
+                self.after(
+                    0,
+                    lambda: self._marcar_conexion(
+                        True, f"Conectado con {destino} ({ip})"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.after(
+                    0,
+                    lambda: self._marcar_conexion(
+                        False, f"Sin conexión con {destino}"
+                    ),
+                )
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Sin conexión",
+                        "No se pudo contactar al compañero.\n"
+                        "Revisa que tenga el despertador abierto,\n"
+                        "la IP sea correcta y el firewall permita la red.\n\n"
+                        f"{exc}",
+                    ),
+                )
+            finally:
+                self.after(0, lambda: self.btn_conexion.config(state="normal"))
+
+        threading.Thread(target=trabajo, daemon=True).start()
+
     def _despertar(self) -> None:
         ruta = self._sonido_seleccionado()
         if not ruta:
@@ -787,11 +1111,109 @@ class App(tk.Tk):
                 "Inicio de Windows", "No estaba agregado al inicio."
             )
 
-    def _al_cerrar(self) -> None:
+    def _iniciar_bandeja(self) -> None:
+        try:
+            self._hwnd_app = _hwnd_de_widget(self)
+            self.bandeja = IconoBandeja(self._hwnd_app, self._pedidos_bandeja)
+        except OSError:
+            self.bandeja = None
+            self.cerrar_a_bandeja_var.set(False)
+            self.chk_bandeja.config(state="disabled")
+            self.btn_bandeja.config(state="disabled")
+            self.estado.config(
+                text="Bandeja no disponible en este PC. El cierre sale del todo."
+            )
+
+    def _procesar_pedidos_bandeja(self) -> None:
+        try:
+            while True:
+                pedido = self._pedidos_bandeja.get_nowait()
+                if pedido == "mostrar":
+                    self._mostrar_desde_bandeja()
+                elif pedido == "menu":
+                    self._menu_bandeja()
+                elif pedido == "salir":
+                    self._salir_del_todo()
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(150, self._procesar_pedidos_bandeja)
+
+    def _menu_bandeja(self) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Mostrar", command=self._mostrar_desde_bandeja)
+        menu.add_command(label="Salir", command=self._salir_del_todo)
+        try:
+            x = self.winfo_pointerx()
+            y = self.winfo_pointery()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _minimizar_a_bandeja(self) -> None:
+        if self.bandeja is None:
+            messagebox.showinfo(
+                "Bandeja",
+                "No se pudo crear el icono de la bandeja en este PC.",
+            )
+            return
+        if self._en_bandeja:
+            return
+        self._guardar_preferencias()
+        try:
+            self.bandeja.mostrar()
+        except OSError as exc:
+            messagebox.showerror("Bandeja", f"No se pudo minimizar:\n{exc}")
+            return
+        self._en_bandeja = True
+        self.withdraw()
+        self.estado.config(
+            text="En bandeja. Clic en el icono o clic derecho → Mostrar."
+        )
+
+    def _mostrar_desde_bandeja(self) -> None:
+        if not self._en_bandeja:
+            return
+        self._en_bandeja = False
+        try:
+            self.deiconify()
+            self.wm_state("normal")
+            self.update_idletasks()
+            if self._hwnd_app:
+                _user32.ShowWindow(self._hwnd_app, _SW_RESTORE)
+                _user32.SetForegroundWindow(self._hwnd_app)
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(100, lambda: self.attributes("-topmost", False))
+            self.focus_force()
+        except tk.TclError:
+            pass
+        # Solo quitar el icono si la ventana quedó visible.
+        if self.winfo_viewable() and self.bandeja is not None:
+            self.bandeja.ocultar()
+        try:
+            self.estado.config(text="Listo. Esperando alarmas…")
+        except tk.TclError:
+            pass
+
+    def _salir_del_todo(self) -> None:
+        self._en_bandeja = False
         self._guardar_preferencias()
         self.stop_event.set()
         _mci(f"close {ALIAS_AUDIO}")
+        if self.bandeja is not None:
+            try:
+                self.bandeja.destruir()
+            except OSError:
+                pass
+            self.bandeja = None
         self.destroy()
+
+    def _al_cerrar(self) -> None:
+        if self.cerrar_a_bandeja_var.get() and self.bandeja is not None:
+            self._minimizar_a_bandeja()
+            return
+        self._salir_del_todo()
 
 
 if __name__ == "__main__":

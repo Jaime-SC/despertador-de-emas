@@ -4,3 +4,7 @@ config.json
 *.tmp
 .DS_Store
 Thumbs.db
+build/
+dist/
+*.spec
+.release_assets/
